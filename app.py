@@ -1,12 +1,14 @@
 import os
-import tempfile
+import shutil
 from pathlib import Path
+from uuid import uuid4
 
 import streamlit as st
 from dotenv import load_dotenv
 
 from modules.ai_tailor import tailor_cv
 from modules.compiler import compile_with_overflow_guard
+from modules.project_loader import inspect_uploaded_project, stage_uploaded_project
 
 # Load the API key from .env.
 load_dotenv()
@@ -64,21 +66,7 @@ st.markdown(
 st.title("CV Tailor AI")
 st.markdown(
     """
-**Paste a job description -> AI tailors your CV automatically -> Download a ready PDF**
-
-No manual editing is required. The design stays the same.
-"""
-)
-
-# Divider line.
-st.divider()
-
-
-# App title and description.
-st.title("CV Tailor AI")
-st.markdown(
-    """
-**Paste a job description -> AI tailors your CV automatically -> Download a ready PDF**
+**Upload `main.tex` or a full `.zip` project -> AI tailors your CV automatically -> Download a ready PDF**
 
 No manual editing is required. The design stays the same.
 """
@@ -120,27 +108,43 @@ with st.sidebar:
 
 # The workflow is split into three steps.
 st.markdown(
-    '<div class="step-header">Step 1: Upload your CV</div>',
+    '<div class="step-header">Step 1: Upload your CV source</div>',
     unsafe_allow_html=True,
 )
 
 uploaded_file = st.file_uploader(
-    "Drag your main.tex file here or browse for it",
-    type=["tex"],
-    help="Exported main.tex file from Overleaf",
+    "Upload a main.tex file or a .zip export of the full LaTeX project",
+    type=["tex", "zip"],
+    help="Use .zip when your CV depends on images, extra .tex files, or other project assets",
 )
 
 # Show a preview after upload.
 if uploaded_file:
-    tex_content = uploaded_file.read().decode("utf-8")
+    uploaded_bytes = uploaded_file.getvalue()
 
-    st.success(f"File uploaded: {uploaded_file.name}")
+    try:
+        inspected_project = inspect_uploaded_project(
+            uploaded_file.name,
+            uploaded_bytes,
+        )
+        tex_content = inspected_project.main_tex_content
 
-    with st.expander("CV Preview (first 30 lines)"):
-        lines = tex_content.split("\n")[:30]
-        st.code("\n".join(lines), language="latex")
+        st.success(f"File uploaded: {uploaded_file.name}")
+        if inspected_project.upload_kind == "zip":
+            st.caption(f"Detected entry file: {inspected_project.main_tex_label}")
+        else:
+            st.caption(f"Using entry file: {inspected_project.main_tex_label}")
+
+        with st.expander("CV Preview (first 30 lines)"):
+            lines = tex_content.split("\n")[:30]
+            st.code("\n".join(lines), language="latex")
+    except ValueError as error:
+        tex_content = None
+        uploaded_bytes = None
+        st.error(str(error))
 else:
     tex_content = None
+    uploaded_bytes = None
 
 st.divider()
 
@@ -231,28 +235,28 @@ if generate_button:
         # Step 2: Compile the PDF.
         status_area.info("Compiling PDF...")
 
+        repo_root = Path(__file__).resolve().parent
+        temp_root = repo_root / ".runtime_tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+
         # Work in a temporary directory so all required assets stay together.
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+        temp_path = temp_root / f"build_{uuid4().hex}"
+        temp_path.mkdir(parents=True, exist_ok=True)
 
-            # Copy class files into the temporary workspace.
-            import shutil
+        try:
+            staged_project = stage_uploaded_project(
+                uploaded_file.name,
+                uploaded_bytes,
+                temp_path,
+                repo_root,
+            )
 
-            cls_files = list(Path(".").glob("*.cls"))
-            for cls_file in cls_files:
-                shutil.copy2(cls_file, temp_path / cls_file.name)
-
-            # Copy the fonts folder when it exists.
-            if Path("fonts").exists():
-                shutil.copytree("fonts", temp_path / "fonts")
-
-            # Create the output folder.
             output_dir = temp_path / "output"
             output_dir.mkdir()
 
             result = compile_with_overflow_guard(
                 tex_content=modified_latex,
-                project_dir=str(temp_path),
+                project_dir=str((temp_path / staged_project.main_tex_label).parent),
                 output_dir=str(output_dir),
                 max_pages=max_pages,
             )
@@ -262,6 +266,8 @@ if generate_button:
                 pdf_path = Path(result["pdf_path"])
                 pdf_bytes = pdf_path.read_bytes()
                 result["pdf_bytes"] = pdf_bytes
+        finally:
+            shutil.rmtree(temp_path, ignore_errors=True)
 
         progress_bar.progress(90, text="Almost done...")
 
@@ -308,9 +314,19 @@ if generate_button:
             **Troubleshooting:**
             - Check whether MiKTeX is installed correctly.
             - Test whether the .tex file is valid in Overleaf.
-            - Review the error details below.
+            - Review the build log below.
             """
             )
+
+        if result.get("log_content"):
+            with st.expander("Build log"):
+                st.code(result["log_content"][:12000], language="text")
+                st.download_button(
+                    label="Download build log",
+                    data=result["log_content"],
+                    file_name="build.log",
+                    mime="text/plain",
+                )
 
     except ValueError as e:
         progress_bar.empty()

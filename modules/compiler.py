@@ -40,8 +40,45 @@ def compile_latex(tex_file_path: str, output_dir: str = "output") -> dict:
 
     console.print(f"Compiling: {tex_path.name}", style="yellow")
 
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-def _run_pdflatex(tex_path: Path, working_dir: str) -> dict:
+    compile_result = _run_xelatex(tex_path, working_dir)
+    if not compile_result["success"]:
+        return {
+            "success": False,
+            "pdf_path": None,
+            "error": compile_result["error"],
+            "pages": 0,
+            "log_excerpt": compile_result.get("log_excerpt"),
+            "log_content": compile_result.get("log_content"),
+        }
+
+    compiled_pdf = tex_path.with_suffix(".pdf")
+    if not compiled_pdf.exists():
+        return {
+            "success": False,
+            "pdf_path": None,
+            "error": "Compilation finished without creating a PDF file.",
+            "pages": 0,
+            "log_excerpt": compile_result.get("log_excerpt"),
+            "log_content": compile_result.get("log_content"),
+        }
+
+    final_pdf = output_path / compiled_pdf.name
+    shutil.copy2(compiled_pdf, final_pdf)
+
+    return {
+        "success": True,
+        "pdf_path": str(final_pdf),
+        "error": None,
+        "pages": _get_page_count(compiled_pdf),
+        "log_excerpt": compile_result.get("log_excerpt"),
+        "log_content": compile_result.get("log_content"),
+    }
+
+
+def _run_xelatex(tex_path: Path, working_dir: str) -> dict:
     """
     Run xelatex twice so references are resolved correctly.
     """
@@ -55,6 +92,8 @@ def _run_pdflatex(tex_path: Path, working_dir: str) -> dict:
     ]
 
     try:
+        log_file = tex_path.with_suffix(".log")
+
         for run_number in range(2):
             console.print(
                 f"  xelatex run {run_number + 1}/2...",
@@ -70,32 +109,57 @@ def _run_pdflatex(tex_path: Path, working_dir: str) -> dict:
             )
 
             if result.returncode != 0:
-                log_file = tex_path.with_suffix(".log")
-                error_details = ""
+                log_content = _read_text_if_exists(log_file)
+                error_lines = [
+                    line for line in log_content.split("\n") if line.startswith("!")
+                ]
+                error_excerpt = "\n".join(error_lines[:8]).strip()
+                primary_error = error_lines[0] if error_lines else ""
 
-                if log_file.exists():
-                    log_content = log_file.read_text(encoding="utf-8", errors="ignore")
-                    error_lines = [
-                        line for line in log_content.split("\n") if line.startswith("!")
+                if not primary_error:
+                    stderr_lines = [
+                        line.strip() for line in result.stderr.splitlines() if line.strip()
                     ]
-                    error_details = "\n".join(error_lines[:5])
+                    stdout_lines = [
+                        line.strip() for line in result.stdout.splitlines() if line.strip()
+                    ]
+                    if stderr_lines:
+                        primary_error = stderr_lines[0]
+                    elif stdout_lines:
+                        primary_error = stdout_lines[0]
+                    else:
+                        primary_error = "xelatex compilation failed."
+
+                if not log_content:
+                    log_content = _build_fallback_log(result.stdout, result.stderr)
 
                 return {
                     "success": False,
-                    "error": f"xelatex error:\n{error_details}",
+                    "error": primary_error,
+                    "log_excerpt": error_excerpt or primary_error,
+                    "log_content": log_content,
                 }
 
-        return {"success": True, "error": None}
+        return {
+            "success": True,
+            "error": None,
+            "log_excerpt": None,
+            "log_content": _read_text_if_exists(log_file),
+        }
 
     except subprocess.TimeoutExpired:
         return {
             "success": False,
             "error": "Compile timeout. The process took longer than 300 seconds.",
+            "log_excerpt": None,
+            "log_content": None,
         }
     except FileNotFoundError:
         return {
             "success": False,
             "error": "xelatex was not found. Check whether MiKTeX is installed correctly.",
+            "log_excerpt": None,
+            "log_content": None,
         }
 
 
@@ -187,7 +251,7 @@ def compile_with_overflow_guard(
     Compile a tailored LaTeX CV and try small layout fixes if it overflows.
 
     tex_content: Modified LaTeX content
-    project_dir: Directory that contains the class file and fonts
+    project_dir: Directory where the entry .tex file should be compiled
     output_dir: Directory where the final PDF should be written
     max_pages: Maximum allowed page count
     """
@@ -208,7 +272,7 @@ def compile_with_overflow_guard(
             )
 
         temp_tex.write_text(current_content, encoding="utf-8")
-        compile_result = _run_pdflatex(temp_tex, str(project_path))
+        compile_result = _run_xelatex(temp_tex, str(project_path))
 
         if not compile_result["success"]:
             _cleanup_temp_files(project_path)
@@ -217,6 +281,8 @@ def compile_with_overflow_guard(
                 "pdf_path": None,
                 "error": compile_result["error"],
                 "pages": 0,
+                "log_excerpt": compile_result.get("log_excerpt"),
+                "log_content": compile_result.get("log_content"),
             }
 
         temp_pdf = project_path / "temp_cv.pdf"
@@ -241,6 +307,8 @@ def compile_with_overflow_guard(
                 "pdf_path": str(final_pdf),
                 "error": None,
                 "pages": pages,
+                "log_excerpt": compile_result.get("log_excerpt"),
+                "log_content": compile_result.get("log_content"),
             }
 
         if attempt < 4:
@@ -259,6 +327,8 @@ def compile_with_overflow_guard(
                 "pdf_path": str(final_pdf),
                 "error": None,
                 "pages": pages,
+                "log_excerpt": compile_result.get("log_excerpt"),
+                "log_content": compile_result.get("log_content"),
             }
 
 
@@ -277,3 +347,25 @@ def _cleanup_temp_files(project_path: Path):
         temp_file = project_path / temp_name
         if temp_file.exists():
             temp_file.unlink()
+
+
+def _read_text_if_exists(file_path: Path) -> str:
+    """
+    Read a text file if it exists.
+    """
+    if not file_path.exists():
+        return ""
+
+    return file_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _build_fallback_log(stdout: str, stderr: str) -> str:
+    """
+    Build a readable fallback log when no LaTeX log file is available.
+    """
+    sections = []
+    if stderr.strip():
+        sections.append(f"STDERR:\n{stderr.strip()}")
+    if stdout.strip():
+        sections.append(f"STDOUT:\n{stdout.strip()}")
+    return "\n\n".join(sections)
