@@ -1,0 +1,4 @@
+anthropic==0.86.0
+python-dotenv==1.2.2
+rich==14.3.3
+streamlit==1.44.1
